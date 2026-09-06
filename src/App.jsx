@@ -1,5 +1,6 @@
 import { useRef, useState, useEffect } from "react";
 import { createDecartClient, models } from "@decartai/sdk";
+import { getCurrentApiKey, rotateToNextKey, totalKeys } from "./services/apiKeyRotator";
 
 function App() {
   const originalVideoRef = useRef(null);
@@ -34,39 +35,82 @@ function App() {
     }
   }, [isLive, editedStream]);
 
+  // Détecte si l'erreur ressemble à un problème de crédits/quota sur la clé API
+  const isCreditOrQuotaError = (err) => {
+    const msg = (err?.message || JSON.stringify(err || "")).toLowerCase();
+    return (
+      msg.includes("credit") ||
+      msg.includes("quota") ||
+      msg.includes("insufficient") ||
+      msg.includes("429") ||
+      msg.includes("402")
+    );
+  };
+
+  const connectWithClient = (apiKey, stream, model) => {
+    const client = createDecartClient({ apiKey });
+
+    return client.realtime.connect(stream, {
+      model,
+      mirror: "auto",
+      initialState: {
+        image: referenceImage,
+        prompt: {
+          text: prompt || "Transforme le sujet pour qu'il ressemble à l'image de référence",
+          enhance,
+        },
+      },
+      onRemoteStream: (newEditedStream) => {
+        setEditedStream(newEditedStream);
+        setIsLive(true);
+        setLoading(false);
+      },
+    });
+  };
+
   const goLive = async () => {
     setLoading(true);
+
+    const model = models.realtime("lucy-2.1");
+    let stream;
+
     try {
-      const client = createDecartClient({
-        apiKey: import.meta.env.VITE_DECART_API_KEY,
-      });
-      const model = models.realtime("lucy-2.1");
-      const stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         video: { frameRate: model.fps, width: model.width, height: model.height },
       });
-
       setRawStream(stream);
-
-      await client.realtime.connect(stream, {
-        model,
-        mirror: "auto",
-        initialState: {
-          image: referenceImage,
-          prompt: {
-            text: prompt || "Transforme le sujet pour qu'il ressemble à l'image de référence",
-            enhance,
-          },
-        },
-        onRemoteStream: (newEditedStream) => {
-          setEditedStream(newEditedStream);
-          setIsLive(true);
-          setLoading(false);
-        },
-      });
     } catch (err) {
-      alert("Erreur: " + (err.message || JSON.stringify(err)));
+      alert("Impossible d'accéder à la caméra : " + (err.message || JSON.stringify(err)));
       setLoading(false);
+      return;
     }
+
+    // Boucle de tentatives : si une clé API échoue (crédits/quota épuisés),
+    // on bascule automatiquement sur la suivante.
+    const maxAttempts = totalKeys();
+    let lastError;
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const apiKey = getCurrentApiKey();
+
+      try {
+        await connectWithClient(apiKey, stream, model);
+        return; // succès, onRemoteStream gère la suite
+      } catch (err) {
+        lastError = err;
+
+        if (isCreditOrQuotaError(err) && attempt < maxAttempts - 1) {
+          console.warn(`Clé #${attempt + 1} indisponible, tentative suivante...`);
+          rotateToNextKey();
+          continue;
+        }
+
+        break;
+      }
+    }
+
+    alert("Erreur: " + (lastError?.message || JSON.stringify(lastError)));
+    setLoading(false);
   };
 
   return (
