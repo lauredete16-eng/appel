@@ -35,8 +35,9 @@ function App() {
     }
   }, [isLive, editedStream]);
 
-  // Détecte si l'erreur ressemble à un problème de crédits/quota sur la clé API
+  // Détecte si l'erreur/raison ressemble à un problème de crédits/quota sur la clé API
   const isCreditOrQuotaError = (err) => {
+    console.log("DEBUG isCreditOrQuotaError reçoit:", err); // ← ligne de debug ajoutée
     const msg = (err?.message || JSON.stringify(err || "")).toLowerCase();
     return (
       msg.includes("credit") ||
@@ -65,7 +66,47 @@ function App() {
         setIsLive(true);
         setLoading(false);
       },
+      // Ces deux callbacks manquaient : sans eux, une coupure de crédit
+      // EN COURS de session ne remontait jamais dans le code.
+      onError: (err) => {
+        console.warn("Erreur realtime:", err);
+        if (isCreditOrQuotaError(err)) {
+          handleRuntimeFailover(stream, model);
+        }
+      },
+      onDisconnect: (reason) => {
+        console.warn("Déconnecté:", reason);
+        if (isCreditOrQuotaError(reason)) {
+          handleRuntimeFailover(stream, model);
+        }
+      },
     });
+  };
+
+  // Reconnexion automatique en cas de coupure liée au crédit/quota,
+  // sans redemander l'accès caméra (on réutilise le stream déjà capturé).
+  const handleRuntimeFailover = async (stream, model) => {
+    if (totalKeys() <= 1) {
+      alert("Toutes les clés API sont épuisées.");
+      setIsLive(false);
+      setLoading(false);
+      return;
+    }
+
+    console.warn("🔄 Coupure liée au crédit, rotation et reconnexion...");
+    rotateToNextKey();
+    setLoading(true);
+
+    try {
+      await connectWithClient(getCurrentApiKey(), stream, model);
+    } catch (err) {
+      if (isCreditOrQuotaError(err)) {
+        handleRuntimeFailover(stream, model); // essaie la clé suivante
+      } else {
+        alert("Erreur: " + (err.message || JSON.stringify(err)));
+        setLoading(false);
+      }
+    }
   };
 
   const goLive = async () => {
@@ -85,8 +126,8 @@ function App() {
       return;
     }
 
-    // Boucle de tentatives : si une clé API échoue (crédits/quota épuisés),
-    // on bascule automatiquement sur la suivante.
+    // Boucle de tentatives : si une clé API échoue dès la connexion initiale
+    // (crédits/quota déjà épuisés), on bascule automatiquement sur la suivante.
     const maxAttempts = totalKeys();
     let lastError;
 
